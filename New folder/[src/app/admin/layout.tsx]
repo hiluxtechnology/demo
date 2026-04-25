@@ -1,0 +1,12 @@
+export default function AdminLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="min-h-screen bg-gray-100">
+      <header className="bg-brand-slate text-white p-4">
+        <h1 className="text-xl font-bold">Admin Dashboard - Ground2Key</h1>
+      </header>
+      <main className="p-8">
+        {children}
+      </main>
+    </div>
+  );
+}

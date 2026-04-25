@@ -1,0 +1,23 @@
+import { createClient } from '@supabase/supabase-js';
+import { safeLog } from '../guardrails/pii-redactor';
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+
+export const supabase = supabaseUrl && supabaseKey 
+  ? createClient(supabaseUrl, supabaseKey) 
+  : null;
+
+export async function saveLead(data: any) {
+  if (!supabase) {
+    safeLog('No Supabase credentials found. Mocking lead save:', data);
+    return { success: true, mocked: true };
+  }
+
+  const { error } = await supabase.from('leads').insert([data]);
+  if (error) {
+    console.error("DB Error:", error);
+    return { success: false, error };
+  }
+  return { success: true };
+}

@@ -1,0 +1,34 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { LeadSchema, ProjectSchema } from '@/lib/schema';
+import { saveLead } from '@/lib/db/supabase';
+import { rateLimit } from '@/lib/guardrails/rate-limiter';
+import { safeLog } from '@/lib/guardrails/pii-redactor';
+
+export async function POST(req: NextRequest) {
+  const ip = req.headers.get('x-forwarded-for') || 'anonymous';
+  if (!rateLimit(ip, 5, 60000)) return NextResponse.json({ error: "Rate limit exceeded" }, { status: 429 });
+
+  try {
+    const body = await req.json();
+    const leadData = LeadSchema.parse(body.lead);
+    const projectData = ProjectSchema.parse(body.project);
+    const estimatedCost = body.estimatedCost;
+
+    safeLog('Saving lead data', { email: leadData.email, phone: leadData.phone });
+
+    const result = await saveLead({
+      name: leadData.name,
+      email: leadData.email,
+      phone: leadData.phone,
+      project_data: projectData,
+      estimated_cost: estimatedCost,
+    });
+
+    if (!result.success) throw new Error("DB Save Failed");
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    console.error(error);
+    return NextResponse.json({ error: "Failed to save lead" }, { status: 400 });
+  }
+}

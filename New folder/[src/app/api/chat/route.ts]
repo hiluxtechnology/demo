@@ -1,0 +1,102 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { ProjectSchema } from '@/lib/schema';
+import { AGENT_A_SYSTEM_PROMPT } from '@/lib/agents/agent-a-prompt';
+import { rateLimit } from '@/lib/guardrails/rate-limiter';
+import { safeLog } from '@/lib/guardrails/pii-redactor';
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+
+export async function POST(req: NextRequest) {
+  // RATE LIMITING GUARDRAIL
+  const ip = req.headers.get('x-forwarded-for') || 'anonymous';
+  if (!rateLimit(ip, 15, 60000)) {
+    return NextResponse.json({ error: "Too many requests" }, { status: 429 });
+  }
+
+  try {
+    const { messages } = await req.json();
+    safeLog('Chat request received');
+
+    const model = genAI.getGenerativeModel({
+      model: "gemini-1.5-pro",
+      systemInstruction: AGENT_A_SYSTEM_PROMPT,
+      tools: [{
+        functionDeclarations: [{
+          name: "finalize_estimation",
+          description: "Call this when you have gathered all required project details from the user.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              plot_size_sqft: { type: "NUMBER", description: "Size of the plot in sqft" },
+              bhk: { type: "NUMBER", description: "Number of bedrooms" },
+              material_grade: { type: "STRING", description: "Standard, Premium, or Luxury" },
+              location: { type: "STRING", description: "City name" },
+              vastu_required: { type: "BOOLEAN", description: "True if Vastu compliance is needed" },
+            },
+            required: ["plot_size_sqft", "bhk", "material_grade", "location", "vastu_required"]
+          }
+        }]
+      }]
+    });
+
+    // Format history for Gemini
+    const chat = model.startChat({
+      history: messages.slice(0, -1).map((m: any) => ({
+        role: m.role === 'user' ? 'user' : 'model',
+        parts: [{ text: m.content }]
+      }))
+    });
+
+    const lastMessage = messages[messages.length - 1].content;
+    const result = await chat.sendMessage(lastMessage);
+    const response = result.response;
+
+    const functionCalls = response.functionCalls();
+    
+    if (functionCalls && functionCalls.length > 0) {
+      const call = functionCalls[0];
+      if (call.name === "finalize_estimation") {
+        const args = call.args;
+        
+        // LOGICAL GUARDRAIL: Validate Schema
+        const parsed = ProjectSchema.safeParse(args);
+        if (!parsed.success) {
+          // Tell the model to correct the user
+          const errorCorrection = await chat.sendMessage([{
+            functionResponse: {
+              name: "finalize_estimation",
+              response: { error: "Validation failed. " + parsed.error.message + ". Please ask user to clarify." }
+            }
+          }]);
+          return NextResponse.json({ role: 'assistant', content: errorCorrection.response.text() });
+        }
+
+        // LOGICAL GUARDRAIL: Physical constraints (e.g. 5 BHK needs > 1500 sqft)
+        const requiredSqft = parsed.data.bhk * 400; // Minimum 400 sqft per BHK
+        if (parsed.data.plot_size_sqft < requiredSqft) {
+          const logicCorrection = await chat.sendMessage([{
+            functionResponse: {
+              name: "finalize_estimation",
+              response: { error: `Physical impossibility: A ${parsed.data.bhk} BHK requires at least ${requiredSqft} sqft. The user provided ${parsed.data.plot_size_sqft} sqft. Politely explain this physical limitation and ask them to adjust either BHK or plot size.` }
+            }
+          }]);
+          return NextResponse.json({ role: 'assistant', content: logicCorrection.response.text() });
+        }
+
+        // Success Handoff to Agent B via Frontend State
+        return NextResponse.json({ 
+          role: 'assistant', 
+          content: "Perfect! I have all the details. Preparing your estimate...",
+          toolResult: parsed.data 
+        });
+      }
+    }
+
+    return NextResponse.json({ role: 'assistant', content: response.text() });
+
+  } catch (error: any) {
+    console.error(error);
+    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
+  }
+}
